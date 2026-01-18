@@ -1,0 +1,30 @@
+# chan_mobile test Makefile
+#
+# Usage:
+#   make -f Makefile.test        # Build and run tests
+#   make -f Makefile.test build  # Build tests only
+#   make -f Makefile.test run    # Run tests only
+#   make -f Makefile.test clean  # Clean test artifacts
+
+CC = gcc
+CFLAGS = -Wall -Wextra -g
+LDFLAGS = -lbluetooth
+
+TEST_BIN = test_chan_mobile
+TEST_SRC = test_chan_mobile.c
+
+.PHONY: all build run clean
+
+all: build run
+
+build: $(TEST_BIN)
+
+$(TEST_BIN): $(TEST_SRC)
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
+run: $(TEST_BIN)
+	@echo ""
+	@./$(TEST_BIN)
+
+clean:
+	rm -f $(TEST_BIN)

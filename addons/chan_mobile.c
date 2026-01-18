@@ -105,9 +105,10 @@ struct adapter_pvt {
 	unsigned int alignment_detection:1;		/* do alignment detection on this adapter? */
 	struct io_context *io;				/*!< io context for audio connections */
 	struct io_context *accept_io;			/*!< io context for sco listener */
-	int *sco_id;					/*!< the io context id of the sco listener socket */
+	int *sco_id;					/*!< the io context id of the sco listener socket (NULL if not registered) */
 	int sco_socket;					/*!< sco listener socket */
 	pthread_t sco_listener_thread;			/*!< sco listener thread */
+	ast_mutex_t lock;				/*!< adapter lock for io_context operations */
 	AST_LIST_ENTRY(adapter_pvt) entry;
 };
 
@@ -135,6 +136,7 @@ struct mbl_pvt {
 	struct ast_smoother *bt_out_smoother;			/* our bt_out_smoother, for making 48 byte frames */
 	struct ast_smoother *bt_in_smoother;			/* our smoother, for making "normal" CHANNEL_FRAME_SIZEed byte frames */
 	int sco_socket;					/* sco socket descriptor */
+	int *sco_io_id;					/*!< io context id for sco_socket (NULL if not registered) */
 	pthread_t monitor_thread;			/* monitor thread handle */
 	int timeout;					/*!< used to set the timeout for rfcomm data (may be used in the future) */
 	unsigned int no_callsetup:1;
@@ -159,6 +161,42 @@ struct mbl_pvt {
 	unsigned int needring:1;	/*!< we need to send a RING */
 	unsigned int answered:1;	/*!< we sent/received an answer */
 	unsigned int connected:1;	/*!< do we have an rfcomm connection to a device */
+
+	/* call state tracking */
+	enum {
+		MBL_CALL_IDLE = 0,		/*!< no call in progress */
+		MBL_CALL_INCOMING_RING,		/*!< incoming call ringing */
+		MBL_CALL_INCOMING_WAIT_CID,	/*!< waiting for caller ID */
+		MBL_CALL_OUTGOING_DIALING,	/*!< outgoing call dialing */
+		MBL_CALL_OUTGOING_ALERTING,	/*!< remote party ringing */
+		MBL_CALL_ACTIVE,		/*!< call connected/active */
+		MBL_CALL_HOLD,			/*!< call on hold */
+		MBL_CALL_WAITING,		/*!< call waiting */
+		MBL_CALL_HANGUP_PENDING,	/*!< hangup in progress */
+	} call_state;
+	char caller_id[64];		/*!< caller ID for current/last call */
+	char dialed_number[64];		/*!< dialed number for outgoing calls */
+	int hangup_cause;		/*!< hangup cause code */
+	unsigned int audio_errors;	/*!< count of audio read/write errors */
+
+	/* connection retry state */
+	int connect_failures;		/*!< consecutive connection failures */
+	time_t last_connect_attempt;	/*!< timestamp of last connection attempt */
+	int backoff_seconds;		/*!< current backoff interval */
+	
+	/* disconnect tracking */
+	char last_disconnect_reason[64];	/*!< reason for last disconnect */
+	time_t last_disconnect_time;		/*!< timestamp of last disconnect */
+
+	/* statistics */
+	unsigned int calls_in;			/*!< incoming calls received */
+	unsigned int calls_out;			/*!< outgoing calls made */
+	unsigned int calls_answered;		/*!< calls answered */
+	unsigned int sms_in;			/*!< SMS messages received */
+	unsigned int sms_out;			/*!< SMS messages sent */
+	time_t connected_since;			/*!< timestamp when device connected */
+	time_t call_start_time;			/*!< timestamp when current call started */
+	unsigned long total_call_seconds;	/*!< total call duration in seconds */
 
 	AST_LIST_ENTRY(mbl_pvt) entry;
 };
@@ -190,11 +228,38 @@ static char *handle_cli_mobile_search(struct ast_cli_entry *e, int cmd, struct a
 static char *handle_cli_mobile_rfcomm(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
 static char *handle_cli_mobile_cusd(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
 
+static char *handle_cli_mobile_show_device(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
+static char *handle_cli_mobile_show_adapters(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
+static char *handle_cli_mobile_reset_backoff(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
+static char *handle_cli_mobile_show_stats(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
+static char *handle_cli_mobile_reset_stats(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
+static char *handle_cli_mobile_check(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
+static char *handle_cli_mobile_disconnect(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
+static char *handle_cli_mobile_show_version(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
+static char *handle_cli_mobile_dial(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
+static char *handle_cli_mobile_answer(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
+static char *handle_cli_mobile_hangup(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
+static char *handle_cli_mobile_sms(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
+static char *handle_cli_mobile_dtmf(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
+
 static struct ast_cli_entry mbl_cli[] = {
 	AST_CLI_DEFINE(handle_cli_mobile_show_devices, "Show Bluetooth Cell / Mobile devices"),
+	AST_CLI_DEFINE(handle_cli_mobile_show_device,  "Show detailed status of a specific device"),
+	AST_CLI_DEFINE(handle_cli_mobile_show_adapters, "Show Bluetooth adapters"),
+	AST_CLI_DEFINE(handle_cli_mobile_show_stats,   "Show call/SMS statistics for all devices"),
 	AST_CLI_DEFINE(handle_cli_mobile_search,       "Search for Bluetooth Cell / Mobile devices"),
 	AST_CLI_DEFINE(handle_cli_mobile_rfcomm,       "Send commands to the rfcomm port for debugging"),
 	AST_CLI_DEFINE(handle_cli_mobile_cusd,         "Send CUSD commands to the mobile"),
+	AST_CLI_DEFINE(handle_cli_mobile_reset_backoff, "Reset connection backoff for a device"),
+	AST_CLI_DEFINE(handle_cli_mobile_reset_stats,  "Reset statistics for a device"),
+	AST_CLI_DEFINE(handle_cli_mobile_check,        "Check device health and connectivity"),
+	AST_CLI_DEFINE(handle_cli_mobile_disconnect,   "Disconnect a device (will auto-reconnect)"),
+	AST_CLI_DEFINE(handle_cli_mobile_show_version, "Show chan_mobile version and features"),
+	AST_CLI_DEFINE(handle_cli_mobile_dial,         "Dial a number on a mobile device"),
+	AST_CLI_DEFINE(handle_cli_mobile_answer,       "Answer an incoming call on a mobile device"),
+	AST_CLI_DEFINE(handle_cli_mobile_hangup,       "Hang up a call on a mobile device"),
+	AST_CLI_DEFINE(handle_cli_mobile_sms,          "Send an SMS via a mobile device"),
+	AST_CLI_DEFINE(handle_cli_mobile_dtmf,         "Send DTMF tones on a mobile device"),
 };
 
 /* App stuff */
@@ -244,6 +309,11 @@ static int sco_connect(bdaddr_t src, bdaddr_t dst);
 static int sco_write(int s, char *buf, int len);
 static int sco_accept(int *id, int fd, short events, void *data);
 static int sco_bind(struct adapter_pvt *adapter);
+
+/* FD lifecycle management helpers */
+static void mbl_io_remove_sco(struct mbl_pvt *pvt);
+static void mbl_io_remove_sco_locked(struct mbl_pvt *pvt);
+static void mbl_io_remove_adapter_sco(struct adapter_pvt *adapter);
 
 static void *do_sco_listen(void *data);
 static int sdp_search(char *addr, int profile);
@@ -341,10 +411,75 @@ struct hfp_cind {
 /*!
  * \brief This struct holds state information about the current hfp connection.
  */
+/*! HFP Service Level Connection states */
+enum hfp_slc_state {
+	HFP_SLC_DISCONNECTED = 0,   /*!< Not connected */
+	HFP_SLC_CONNECTING,         /*!< RFCOMM connected, starting SLC setup */
+	HFP_SLC_BRSF_SENT,          /*!< Sent AT+BRSF, waiting for response */
+	HFP_SLC_CIND_TEST_SENT,     /*!< Sent AT+CIND=?, waiting for response */
+	HFP_SLC_CIND_SENT,          /*!< Sent AT+CIND?, waiting for response */
+	HFP_SLC_CMER_SENT,          /*!< Sent AT+CMER, waiting for response */
+	HFP_SLC_CLIP_SENT,          /*!< Sent AT+CLIP, waiting for response */
+	HFP_SLC_ECAM_SENT,          /*!< Sent AT*ECAM (Sony Ericsson), waiting for response */
+	HFP_SLC_VGS_SENT,           /*!< Sent AT+VGS, waiting for response */
+	HFP_SLC_CMGF_SENT,          /*!< Sent AT+CMGF (SMS mode), waiting for response */
+	HFP_SLC_CNMI_SENT,          /*!< Sent AT+CNMI (SMS notification), waiting for response */
+	HFP_SLC_CONNECTED,          /*!< SLC established, ready for calls */
+};
+
+/*! Convert HFP SLC state to string for logging */
+static const char *hfp_slc_state_str(enum hfp_slc_state state)
+{
+	switch (state) {
+	case HFP_SLC_DISCONNECTED:   return "DISCONNECTED";
+	case HFP_SLC_CONNECTING:     return "CONNECTING";
+	case HFP_SLC_BRSF_SENT:      return "BRSF_SENT";
+	case HFP_SLC_CIND_TEST_SENT: return "CIND_TEST_SENT";
+	case HFP_SLC_CIND_SENT:      return "CIND_SENT";
+	case HFP_SLC_CMER_SENT:      return "CMER_SENT";
+	case HFP_SLC_CLIP_SENT:      return "CLIP_SENT";
+	case HFP_SLC_ECAM_SENT:      return "ECAM_SENT";
+	case HFP_SLC_VGS_SENT:       return "VGS_SENT";
+	case HFP_SLC_CMGF_SENT:      return "CMGF_SENT";
+	case HFP_SLC_CNMI_SENT:      return "CNMI_SENT";
+	case HFP_SLC_CONNECTED:      return "CONNECTED";
+	default:                     return "UNKNOWN";
+	}
+}
+
+/*! Convert call state to string for logging/CLI */
+static const char *mbl_call_state_str(int state)
+{
+	switch (state) {
+	case MBL_CALL_IDLE:             return "IDLE";
+	case MBL_CALL_INCOMING_RING:    return "INCOMING_RING";
+	case MBL_CALL_INCOMING_WAIT_CID: return "WAIT_CALLER_ID";
+	case MBL_CALL_OUTGOING_DIALING: return "DIALING";
+	case MBL_CALL_OUTGOING_ALERTING: return "ALERTING";
+	case MBL_CALL_ACTIVE:           return "ACTIVE";
+	case MBL_CALL_HOLD:             return "HOLD";
+	case MBL_CALL_WAITING:          return "WAITING";
+	case MBL_CALL_HANGUP_PENDING:   return "HANGUP_PENDING";
+	default:                        return "UNKNOWN";
+	}
+}
+
+/*! Set call state with logging */
+static void mbl_set_call_state(struct mbl_pvt *pvt, int new_state)
+{
+	int old_state = pvt->call_state;
+	if (old_state != new_state) {
+		ast_verb(4, "[%s] Call state: %s -> %s\n", pvt->id,
+			mbl_call_state_str(old_state), mbl_call_state_str(new_state));
+		pvt->call_state = new_state;
+	}
+}
+
 struct hfp_pvt {
 	struct mbl_pvt *owner;		/*!< the mbl_pvt struct that owns this struct */
 	int initialized:1;		/*!< whether a service level connection exists or not */
 	int nocallsetup:1;		/*!< whether we detected a callsetup indicator */
+	enum hfp_slc_state slc_state;	/*!< current SLC state machine state */
 	struct hfp_ag brsf;		/*!< the supported feature set of the AG */
 	int cind_index[16];		/*!< the cind/ciev index to name mapping for this AG */
 	int cind_state[16];		/*!< the cind/ciev state for this AG */
@@ -490,221 +625,8 @@ static struct ast_channel_tech mbl_tech = {
 	.devicestate = mbl_devicestate
 };
 
-/* CLI Commands implementation */
-
-static char *handle_cli_mobile_show_devices(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
-{
-	struct mbl_pvt *pvt;
-	char bdaddr[18];
-	char group[6];
-
-#define FORMAT1 "%-15.15s %-17.17s %-5.5s %-15.15s %-9.9s %-10.10s %-3.3s\n"
-
-	switch (cmd) {
-	case CLI_INIT:
-		e->command = "mobile show devices";
-		e->usage =
-			"Usage: mobile show devices\n"
-			"       Shows the state of Bluetooth Cell / Mobile devices.\n";
-		return NULL;
-	case CLI_GENERATE:
-		return NULL;
-	}
-
-	if (a->argc != 3)
-		return CLI_SHOWUSAGE;
-
-	ast_cli(a->fd, FORMAT1, "ID", "Address", "Group", "Adapter", "Connected", "State", "SMS");
-	AST_RWLIST_RDLOCK(&devices);
-	AST_RWLIST_TRAVERSE(&devices, pvt, entry) {
-		ast_mutex_lock(&pvt->lock);
-		ba2str(&pvt->addr, bdaddr);
-		snprintf(group, sizeof(group), "%d", pvt->group);
-		ast_cli(a->fd, FORMAT1,
-				pvt->id,
-				bdaddr,
-				group,
-				pvt->adapter->id,
-				pvt->connected ? "Yes" : "No",
-				(!pvt->connected) ? "None" : (pvt->owner) ? "Busy" : (pvt->outgoing_sms || pvt->incoming_sms) ? "SMS" : (mbl_has_service(pvt)) ? "Free" : "No Service",
-				(pvt->has_sms) ? "Yes" : "No"
-		       );
-		ast_mutex_unlock(&pvt->lock);
-	}
-	AST_RWLIST_UNLOCK(&devices);
-
-#undef FORMAT1
-
-	return CLI_SUCCESS;
-}
-
-static char *handle_cli_mobile_search(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
-{
-	struct adapter_pvt *adapter;
-	inquiry_info *ii = NULL;
-	int max_rsp, num_rsp;
-	int len, flags;
-	int i, phport, hsport;
-	char addr[19] = {0};
-	char name[31] = {0};
-
-#define FORMAT1 "%-17.17s %-30.30s %-6.6s %-7.7s %-4.4s\n"
-#define FORMAT2 "%-17.17s %-30.30s %-6.6s %-7.7s %d\n"
-
-	switch (cmd) {
-	case CLI_INIT:
-		e->command = "mobile search";
-		e->usage =
-			"Usage: mobile search\n"
-			"       Searches for Bluetooth Cell / Mobile devices in range.\n";
-		return NULL;
-	case CLI_GENERATE:
-		return NULL;
-	}
-
-	if (a->argc != 2)
-		return CLI_SHOWUSAGE;
-
-	/* find a free adapter */
-	AST_RWLIST_RDLOCK(&adapters);
-	AST_RWLIST_TRAVERSE(&adapters, adapter, entry) {
-		if (!adapter->inuse)
-			break;
-	}
-	AST_RWLIST_UNLOCK(&adapters);
-
-	if (!adapter) {
-		ast_cli(a->fd, "All Bluetooth adapters are in use at this time.\n");
-		return CLI_SUCCESS;
-	}
-
-	len  = 8;
-	max_rsp = 255;
-	flags = IREQ_CACHE_FLUSH;
-
-	ii = ast_alloca(max_rsp * sizeof(inquiry_info));
-	num_rsp = hci_inquiry(adapter->dev_id, len, max_rsp, NULL, &ii, flags);
-	if (num_rsp > 0) {
-		ast_cli(a->fd, FORMAT1, "Address", "Name", "Usable", "Type", "Port");
-		for (i = 0; i < num_rsp; i++) {
-			ba2str(&(ii + i)->bdaddr, addr);
-			name[0] = 0x00;
-			if (hci_read_remote_name(adapter->hci_socket, &(ii + i)->bdaddr, sizeof(name) - 1, name, 0) < 0)
-				strcpy(name, "[unknown]");
-			phport = sdp_search(addr, HANDSFREE_AGW_PROFILE_ID);
-			if (!phport)
-				hsport = sdp_search(addr, HEADSET_PROFILE_ID);
-			else
-				hsport = 0;
-			ast_cli(a->fd, FORMAT2, addr, name, (phport > 0 || hsport > 0) ? "Yes" : "No",
-				(phport > 0) ? "Phone" : "Headset", (phport > 0) ? phport : hsport);
-		}
-	} else
-		ast_cli(a->fd, "No Bluetooth Cell / Mobile devices found.\n");
-
-#undef FORMAT1
-#undef FORMAT2
-
-	return CLI_SUCCESS;
-}
-
-static char *handle_cli_mobile_rfcomm(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
-{
-	char buf[128];
-	struct mbl_pvt *pvt = NULL;
-
-	switch (cmd) {
-	case CLI_INIT:
-		e->command = "mobile rfcomm";
-		e->usage =
-			"Usage: mobile rfcomm <device ID> <command>\n"
-			"       Send <command> to the rfcomm port on the device\n"
-			"       with the specified <device ID>.\n";
-		return NULL;
-	case CLI_GENERATE:
-		return NULL;
-	}
-
-	if (a->argc != 4)
-		return CLI_SHOWUSAGE;
-
-	AST_RWLIST_RDLOCK(&devices);
-	AST_RWLIST_TRAVERSE(&devices, pvt, entry) {
-		if (!strcmp(pvt->id, a->argv[2]))
-			break;
-	}
-	AST_RWLIST_UNLOCK(&devices);
-
-	if (!pvt) {
-		ast_cli(a->fd, "Device %s not found.\n", a->argv[2]);
-		goto e_return;
-	}
-
-	ast_mutex_lock(&pvt->lock);
-	if (!pvt->connected) {
-		ast_cli(a->fd, "Device %s not connected.\n", a->argv[2]);
-		goto e_unlock_pvt;
-	}
-
-	snprintf(buf, sizeof(buf), "%s\r", a->argv[3]);
-	rfcomm_write(pvt->rfcomm_socket, buf);
-	msg_queue_push(pvt, AT_OK, AT_UNKNOWN);
-
-e_unlock_pvt:
-	ast_mutex_unlock(&pvt->lock);
-e_return:
-	return CLI_SUCCESS;
-}
-
-static char *handle_cli_mobile_cusd(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
-{
-	char buf[128];
-	struct mbl_pvt *pvt = NULL;
-
-	switch (cmd) {
-	case CLI_INIT:
-		e->command = "mobile cusd";
-		e->usage =
-			"Usage: mobile cusd <device ID> <command>\n"
-			"       Send cusd <command> to the rfcomm port on the device\n"
-			"       with the specified <device ID>.\n";
-		return NULL;
-	case CLI_GENERATE:
-		return NULL;
-	}
-
-	if (a->argc != 4)
-		return CLI_SHOWUSAGE;
-
-	AST_RWLIST_RDLOCK(&devices);
-	AST_RWLIST_TRAVERSE(&devices, pvt, entry) {
-		if (!strcmp(pvt->id, a->argv[2]))
-			break;
-	}
-	AST_RWLIST_UNLOCK(&devices);
-
-	if (!pvt) {
-		ast_cli(a->fd, "Device %s not found.\n", a->argv[2]);
-		goto e_return;
-	}
-
-	ast_mutex_lock(&pvt->lock);
-	if (!pvt->connected) {
-		ast_cli(a->fd, "Device %s not connected.\n", a->argv[2]);
-		goto e_unlock_pvt;
-	}
-
-	snprintf(buf, sizeof(buf), "%s", a->argv[3]);
-	if (hfp_send_cusd(pvt->hfp, buf) || msg_queue_push(pvt, AT_OK, AT_CUSD)) {
-		ast_cli(a->fd, "[%s] error sending CUSD\n", pvt->id);
-		goto e_unlock_pvt;
-	}
-
-e_unlock_pvt:
-	ast_mutex_unlock(&pvt->lock);
-e_return:
-	return CLI_SUCCESS;
-}
+/* CLI Commands implementation - in separate file */
+#include "chan_mobile_cli.c"
 
 /*
 
@@ -1002,7 +924,15 @@ static int mbl_call(struct ast_channel *ast, const char *dest, int timeout)
 		}
 		pvt->hangupcause = 0;
 		pvt->needchup = 1;
+		ast_copy_string(pvt->dialed_number, dest_num, sizeof(pvt->dialed_number));
+		mbl_set_call_state(pvt, MBL_CALL_OUTGOING_DIALING);
 		msg_queue_push(pvt, AT_OK, AT_D);
+		
+		/* Emit AMI event for outgoing call */
+		manager_event(EVENT_FLAG_CALL, "MobileCallOutgoing",
+			"Device: %s\r\n"
+			"Destination: %s\r\n",
+			pvt->id, dest_num);
 	} else {
 		if (hsp_send_ring(pvt->rfcomm_socket)) {
 			ast_log(LOG_ERROR, "[%s] error ringing device\n", pvt->id);
@@ -1018,6 +948,7 @@ static int mbl_call(struct ast_channel *ast, const char *dest, int timeout)
 
 		pvt->outgoing = 1;
 		pvt->needring = 1;
+		mbl_set_call_state(pvt, MBL_CALL_OUTGOING_DIALING);
 	}
 	ast_mutex_unlock(&pvt->lock);
 
@@ -1029,6 +960,13 @@ static int mbl_hangup(struct ast_channel *ast)
 {
 
 	struct mbl_pvt *pvt;
+	int call_duration = 0;
+	int was_answered = 0;
+	int was_incoming = 0;
+	int was_outgoing = 0;
+	int old_call_state;
+	char caller_id_copy[64] = "";
+	char dialed_number_copy[64] = "";
 
 	if (!ast_channel_tech_pvt(ast)) {
 		ast_log(LOG_WARNING, "Asked to hangup channel not connected\n");
@@ -1039,9 +977,27 @@ static int mbl_hangup(struct ast_channel *ast)
 	ast_debug(1, "[%s] hanging up device\n", pvt->id);
 
 	ast_mutex_lock(&pvt->lock);
+	
+	old_call_state = pvt->call_state;
+	
+	/* Calculate call duration if call was answered */
+	if (pvt->call_start_time > 0) {
+		call_duration = (int)(time(NULL) - pvt->call_start_time);
+		pvt->total_call_seconds += call_duration;
+		pvt->call_start_time = 0;
+		was_answered = 1;
+	}
+	was_incoming = pvt->incoming;
+	was_outgoing = pvt->outgoing;
+	
+	/* Save caller info before clearing */
+	ast_copy_string(caller_id_copy, pvt->caller_id, sizeof(caller_id_copy));
+	ast_copy_string(dialed_number_copy, pvt->dialed_number, sizeof(dialed_number_copy));
+	
+	mbl_set_call_state(pvt, MBL_CALL_HANGUP_PENDING);
+	
 	ast_channel_set_fd(ast, 0, -1);
-	close(pvt->sco_socket);
-	pvt->sco_socket = -1;
+	mbl_io_remove_sco_locked(pvt);  /* safe: remove from io_context then close */
 
 	if (pvt->needchup) {
 		hfp_send_chup(pvt->hfp);
@@ -1052,10 +1008,38 @@ static int mbl_hangup(struct ast_channel *ast)
 	pvt->outgoing = 0;
 	pvt->incoming = 0;
 	pvt->needring = 0;
+	pvt->answered = 0;
 	pvt->owner = NULL;
+	pvt->caller_id[0] = '\0';
+	pvt->dialed_number[0] = '\0';
+	pvt->audio_errors = 0;
+	mbl_set_call_state(pvt, MBL_CALL_IDLE);
 	ast_channel_tech_pvt_set(ast, NULL);
 
 	ast_mutex_unlock(&pvt->lock);
+
+	/* Emit AMI event for call end */
+	manager_event(EVENT_FLAG_CALL, "MobileCallEnd",
+		"Device: %s\r\n"
+		"Direction: %s\r\n"
+		"Duration: %d\r\n"
+		"Answered: %s\r\n"
+		"CallerID: %s\r\n"
+		"DialedNumber: %s\r\n"
+		"PreviousState: %s\r\n",
+		pvt->id,
+		was_incoming ? "Incoming" : (was_outgoing ? "Outgoing" : "Unknown"),
+		call_duration,
+		was_answered ? "Yes" : "No",
+		caller_id_copy,
+		dialed_number_copy,
+		mbl_call_state_str(old_call_state));
+	
+	if (was_answered) {
+		ast_verb(3, "[%s] Call ended, duration: %d seconds\n", pvt->id, call_duration);
+	} else {
+		ast_verb(3, "[%s] Call ended (not answered)\n", pvt->id);
+	}
 
 	ast_setstate(ast, AST_STATE_DOWN);
 
@@ -1078,6 +1062,14 @@ static int mbl_answer(struct ast_channel *ast)
 		hfp_send_ata(pvt->hfp);
 		msg_queue_push(pvt, AT_OK, AT_A);
 		pvt->answered = 1;
+		pvt->calls_answered++;
+		pvt->call_start_time = time(NULL);
+		mbl_set_call_state(pvt, MBL_CALL_ACTIVE);
+		manager_event(EVENT_FLAG_CALL, "MobileCallStart",
+			"Device: %s\r\n"
+			"Direction: Incoming\r\n"
+			"CallerID: %s\r\n",
+			pvt->id, pvt->caller_id);
 	}
 	ast_mutex_unlock(&pvt->lock);
 
@@ -1136,9 +1128,19 @@ static struct ast_frame *mbl_read(struct ast_channel *ast)
 	do {
 		if ((r = read(pvt->sco_socket, pvt->fr.data.ptr, DEVICE_FRAME_SIZE)) == -1) {
 			if (errno != EAGAIN && errno != EINTR) {
-				ast_debug(1, "[%s] read error %d, going to wait for new connection\n", pvt->id, errno);
-				close(pvt->sco_socket);
-				pvt->sco_socket = -1;
+				ast_debug(1, "[%s] SCO read error %d (%s), closing socket\n", 
+				          pvt->id, errno, strerror(errno));
+				pvt->audio_errors++;
+				/* Emit AMI event on first audio error or every 10th */
+				if (pvt->audio_errors == 1 || (pvt->audio_errors % 10) == 0) {
+					manager_event(EVENT_FLAG_CALL, "MobileAudioError",
+						"Device: %s\r\n"
+						"ErrorCount: %u\r\n"
+						"Error: %s\r\n",
+						pvt->id, pvt->audio_errors, strerror(errno));
+				}
+				/* Safely close SCO socket - remove from io_context first */
+				mbl_io_remove_sco_locked(pvt);
 				ast_channel_set_fd(ast, 0, -1);
 			}
 			goto e_return;
@@ -1459,9 +1461,11 @@ static int rfcomm_write_full(int rsock, char *buf, size_t count)
 	ast_debug(1, "rfcomm_write() (%d) [%.*s]\n", rsock, (int) count, buf);
 	while (count > 0) {
 		if ((out_count = write(rsock, p, count)) == -1) {
-			ast_debug(1, "rfcomm_write() error [%d]\n", errno);
+			ast_log(LOG_WARNING, "rfcomm_write() error: %s (errno=%d, socket=%d)\n", 
+				strerror(errno), errno, rsock);
 			return -1;
 		}
+		ast_debug(2, "rfcomm_write() wrote %zd bytes\n", out_count);
 		count -= out_count;
 		p += out_count;
 	}
@@ -1826,6 +1830,98 @@ static ssize_t rfcomm_read(int rsock, char *buf, size_t count)
 
 /*
 
+	FD lifecycle management helpers
+	These ensure proper tracking of io_context IDs and safe FD cleanup
+
+*/
+
+/*!
+ * \brief Safely remove and close a device SCO socket
+ * \param pvt Device private structure
+ * \note Caller must NOT hold pvt->lock
+ */
+static void mbl_io_remove_sco(struct mbl_pvt *pvt)
+{
+	if (!pvt) {
+		return;
+	}
+	
+	ast_mutex_lock(&pvt->lock);
+	
+	/* Remove from io_context first */
+	if (pvt->sco_io_id && pvt->adapter && pvt->adapter->io) {
+		ast_io_remove(pvt->adapter->io, pvt->sco_io_id);
+		ast_debug(2, "[%s] Removed SCO socket from io_context\n", pvt->id);
+		pvt->sco_io_id = NULL;
+	}
+	
+	/* Then close the socket */
+	if (pvt->sco_socket != -1) {
+		close(pvt->sco_socket);
+		pvt->sco_socket = -1;
+		ast_debug(2, "[%s] Closed SCO socket\n", pvt->id);
+	}
+	
+	ast_mutex_unlock(&pvt->lock);
+}
+
+/*!
+ * \brief Safely remove and close a device SCO socket (lock already held)
+ * \param pvt Device private structure
+ * \note Caller MUST hold pvt->lock
+ */
+static void mbl_io_remove_sco_locked(struct mbl_pvt *pvt)
+{
+	if (!pvt) {
+		return;
+	}
+	
+	/* Remove from io_context first */
+	if (pvt->sco_io_id && pvt->adapter && pvt->adapter->io) {
+		ast_io_remove(pvt->adapter->io, pvt->sco_io_id);
+		ast_debug(2, "[%s] Removed SCO socket from io_context\n", pvt->id);
+		pvt->sco_io_id = NULL;
+	}
+	
+	/* Then close the socket */
+	if (pvt->sco_socket != -1) {
+		close(pvt->sco_socket);
+		pvt->sco_socket = -1;
+		ast_debug(2, "[%s] Closed SCO socket\n", pvt->id);
+	}
+}
+
+/*!
+ * \brief Safely remove and close adapter SCO listener socket
+ * \param adapter Adapter private structure
+ */
+static void mbl_io_remove_adapter_sco(struct adapter_pvt *adapter)
+{
+	if (!adapter) {
+		return;
+	}
+	
+	ast_mutex_lock(&adapter->lock);
+	
+	/* Remove from io_context first */
+	if (adapter->sco_id && adapter->accept_io) {
+		ast_io_remove(adapter->accept_io, adapter->sco_id);
+		ast_debug(2, "[%s] Removed SCO listener from io_context\n", adapter->id);
+		adapter->sco_id = NULL;
+	}
+	
+	/* Then close the socket */
+	if (adapter->sco_socket != -1) {
+		close(adapter->sco_socket);
+		adapter->sco_socket = -1;
+		ast_debug(2, "[%s] Closed SCO listener socket\n", adapter->id);
+	}
+	
+	ast_mutex_unlock(&adapter->lock);
+}
+
+/*
+
 	sco helpers and callbacks
 
 */
@@ -1933,16 +2029,20 @@ static int sco_accept(int *id, int fd, short events, void *data)
 	}
 
 	ast_mutex_lock(&pvt->lock);
+	
+	/* Safely close existing SCO socket if present */
 	if (pvt->sco_socket != -1) {
-		close(pvt->sco_socket);
-		pvt->sco_socket = -1;
+		/* Remove from io_context first to avoid EBADF in ast_io_wait */
+		mbl_io_remove_sco_locked(pvt);
 	}
 
 	pvt->sco_socket = sock;
+	pvt->sco_io_id = NULL; /* New socket not yet registered in io_context */
+	
 	if (pvt->owner) {
 		ast_channel_set_fd(pvt->owner, 0, sock);
 	} else {
-		ast_debug(1, "incoming audio connection for pvt without owner\n");
+		ast_debug(1, "[%s] incoming audio connection for pvt without owner\n", pvt->id);
 	}
 
 	ast_mutex_unlock(&pvt->lock);
@@ -3280,16 +3380,20 @@ static int handle_response_ok(struct mbl_pvt *pvt, char *buf)
 
 		/* initialization stuff */
 		case AT_BRSF:
-			ast_debug(1, "[%s] BSRF sent successfully\n", pvt->id);
+			ast_debug(1, "[%s] BRSF sent successfully\n", pvt->id);
+			pvt->hfp->slc_state = HFP_SLC_BRSF_SENT;
+			ast_verb(4, "[%s] HFP SLC: BRSF complete\n", pvt->id);
 
 			/* If this is a blackberry do CMER now, otherwise
 			 * continue with CIND as normal. */
 			if (pvt->blackberry) {
+				pvt->hfp->slc_state = HFP_SLC_CMER_SENT;
 				if (hfp_send_cmer(pvt->hfp, 1) || msg_queue_push(pvt, AT_OK, AT_CMER)) {
 					ast_debug(1, "[%s] error sending CMER\n", pvt->id);
 					goto e_return;
 				}
 			} else {
+				pvt->hfp->slc_state = HFP_SLC_CIND_TEST_SENT;
 				if (hfp_send_cind_test(pvt->hfp) || msg_queue_push(pvt, AT_CIND, AT_CIND_TEST)) {
 					ast_debug(1, "[%s] error sending CIND test\n", pvt->id);
 					goto e_return;
@@ -3298,11 +3402,14 @@ static int handle_response_ok(struct mbl_pvt *pvt, char *buf)
 			break;
 		case AT_CIND_TEST:
 			ast_debug(1, "[%s] CIND test sent successfully\n", pvt->id);
+			ast_verb(4, "[%s] HFP SLC: CIND test complete (call=%d, callsetup=%d, service=%d)\n", 
+				pvt->id, pvt->hfp->cind_map.call, pvt->hfp->cind_map.callsetup, pvt->hfp->cind_map.service);
 
 			ast_debug(2, "[%s] call: %d\n", pvt->id, pvt->hfp->cind_map.call);
 			ast_debug(2, "[%s] callsetup: %d\n", pvt->id, pvt->hfp->cind_map.callsetup);
 			ast_debug(2, "[%s] service: %d\n", pvt->id, pvt->hfp->cind_map.service);
 
+			pvt->hfp->slc_state = HFP_SLC_CIND_SENT;
 			if (hfp_send_cind(pvt->hfp) || msg_queue_push(pvt, AT_CIND, AT_CIND)) {
 				ast_debug(1, "[%s] error requesting CIND state\n", pvt->id);
 				goto e_return;
@@ -3310,6 +3417,7 @@ static int handle_response_ok(struct mbl_pvt *pvt, char *buf)
 			break;
 		case AT_CIND:
 			ast_debug(1, "[%s] CIND sent successfully\n", pvt->id);
+			ast_verb(4, "[%s] HFP SLC: CIND state received\n", pvt->id);
 
 			/* check if a call is active */
 			if (pvt->hfp->cind_state[pvt->hfp->cind_map.call]) {
@@ -3320,11 +3428,13 @@ static int handle_response_ok(struct mbl_pvt *pvt, char *buf)
 			/* If this is NOT a blackberry proceed with CMER,
 			 * otherwise send CLIP. */
 			if (!pvt->blackberry) {
+				pvt->hfp->slc_state = HFP_SLC_CMER_SENT;
 				if (hfp_send_cmer(pvt->hfp, 1) || msg_queue_push(pvt, AT_OK, AT_CMER)) {
 					ast_debug(1, "[%s] error sending CMER\n", pvt->id);
 					goto e_return;
 				}
 			} else {
+				pvt->hfp->slc_state = HFP_SLC_CLIP_SENT;
 				if (hfp_send_clip(pvt->hfp, 1) || msg_queue_push(pvt, AT_OK, AT_CLIP)) {
 					ast_debug(1, "[%s] error enabling calling line notification\n", pvt->id);
 					goto e_return;
@@ -3333,15 +3443,18 @@ static int handle_response_ok(struct mbl_pvt *pvt, char *buf)
 			break;
 		case AT_CMER:
 			ast_debug(1, "[%s] CMER sent successfully\n", pvt->id);
+			ast_verb(4, "[%s] HFP SLC: CMER (event reporting) enabled\n", pvt->id);
 
 			/* If this is a blackberry proceed with the CIND test,
 			 * otherwise send CLIP. */
 			if (pvt->blackberry) {
+				pvt->hfp->slc_state = HFP_SLC_CIND_TEST_SENT;
 				if (hfp_send_cind_test(pvt->hfp) || msg_queue_push(pvt, AT_CIND, AT_CIND_TEST)) {
 					ast_debug(1, "[%s] error sending CIND test\n", pvt->id);
 					goto e_return;
 				}
 			} else {
+				pvt->hfp->slc_state = HFP_SLC_CLIP_SENT;
 				if (hfp_send_clip(pvt->hfp, 1) || msg_queue_push(pvt, AT_OK, AT_CLIP)) {
 					ast_debug(1, "[%s] error enabling calling line notification\n", pvt->id);
 					goto e_return;
@@ -3350,6 +3463,8 @@ static int handle_response_ok(struct mbl_pvt *pvt, char *buf)
 			break;
 		case AT_CLIP:
 			ast_debug(1, "[%s] calling line indication enabled\n", pvt->id);
+			ast_verb(4, "[%s] HFP SLC: CLIP (caller ID) enabled\n", pvt->id);
+			pvt->hfp->slc_state = HFP_SLC_ECAM_SENT;
 			if (hfp_send_ecam(pvt->hfp) || msg_queue_push(pvt, AT_OK, AT_ECAM)) {
 				ast_debug(1, "[%s] error enabling Sony Ericsson call monitoring extensions\n", pvt->id);
 				goto e_return;
@@ -3358,21 +3473,38 @@ static int handle_response_ok(struct mbl_pvt *pvt, char *buf)
 			break;
 		case AT_ECAM:
 			ast_debug(1, "[%s] Sony Ericsson call monitoring is active on device\n", pvt->id);
+			ast_verb(4, "[%s] HFP SLC: ECAM (Sony Ericsson extensions) enabled\n", pvt->id);
+			pvt->hfp->slc_state = HFP_SLC_VGS_SENT;
 			if (hfp_send_vgs(pvt->hfp, 15) || msg_queue_push(pvt, AT_OK, AT_VGS)) {
 				ast_debug(1, "[%s] error synchronizing gain settings\n", pvt->id);
 				goto e_return;
 			}
 
-			pvt->timeout = -1;
+			/* Use 60 second timeout for keepalive - if no data for 60s, we'll check connection */
+			pvt->timeout = 60000;
 			pvt->hfp->initialized = 1;
+			pvt->hfp->slc_state = HFP_SLC_CONNECTED;
 			ast_verb(3, "Bluetooth Device %s initialized and ready.\n", pvt->id);
+			ast_verb(4, "[%s] HFP SLC: Service Level Connection established\n", pvt->id);
+			manager_event(EVENT_FLAG_SYSTEM, "MobileStatus",
+				"Status: Initialized\r\n"
+				"Device: %s\r\n"
+				"Service: %d\r\n"
+				"Signal: %d\r\n"
+				"Battery: %d\r\n",
+				pvt->id, 
+				pvt->hfp->cind_state[pvt->hfp->cind_map.service],
+				pvt->hfp->cind_state[pvt->hfp->cind_map.signal],
+				pvt->hfp->cind_state[pvt->hfp->cind_map.battchg]);
 
 			break;
 		case AT_VGS:
 			ast_debug(1, "[%s] volume level synchronization successful\n", pvt->id);
+			ast_verb(4, "[%s] HFP SLC: VGS (volume) synchronized\n", pvt->id);
 
 			/* set the SMS operating mode to text mode */
 			if (pvt->has_sms) {
+				pvt->hfp->slc_state = HFP_SLC_CMGF_SENT;
 				if (hfp_send_cmgf(pvt->hfp, 1) || msg_queue_push(pvt, AT_OK, AT_CMGF)) {
 					ast_debug(1, "[%s] error setting CMGF\n", pvt->id);
 					goto e_return;
@@ -3381,6 +3513,8 @@ static int handle_response_ok(struct mbl_pvt *pvt, char *buf)
 			break;
 		case AT_CMGF:
 			ast_debug(1, "[%s] sms text mode enabled\n", pvt->id);
+			ast_verb(4, "[%s] HFP SLC: CMGF (SMS text mode) enabled\n", pvt->id);
+			pvt->hfp->slc_state = HFP_SLC_CNMI_SENT;
 			/* turn on SMS new message indication */
 			if (hfp_send_cnmi(pvt->hfp) || msg_queue_push(pvt, AT_OK, AT_CNMI)) {
 				ast_debug(1, "[%s] error setting CNMI\n", pvt->id);
@@ -3389,6 +3523,7 @@ static int handle_response_ok(struct mbl_pvt *pvt, char *buf)
 			break;
 		case AT_CNMI:
 			ast_debug(1, "[%s] sms new message indication enabled\n", pvt->id);
+			ast_verb(4, "[%s] HFP SLC: CNMI (SMS notification) enabled - SMS ready\n", pvt->id);
 			pvt->has_sms = 1;
 			break;
 		/* end initialization stuff */
@@ -3401,6 +3536,7 @@ static int handle_response_ok(struct mbl_pvt *pvt, char *buf)
 			ast_debug(1, "[%s] dial sent successfully\n", pvt->id);
 			pvt->needchup = 1;
 			pvt->outgoing = 1;
+			pvt->calls_out++;
 			mbl_queue_control(pvt, AST_CONTROL_PROGRESS);
 			break;
 		case AT_CHUP:
@@ -3409,6 +3545,7 @@ static int handle_response_ok(struct mbl_pvt *pvt, char *buf)
 		case AT_CMGS:
 			ast_debug(1, "[%s] successfully sent sms message\n", pvt->id);
 			pvt->outgoing_sms = 0;
+			pvt->sms_out++;
 			break;
 		case AT_VTS:
 			ast_debug(1, "[%s] digit sent successfully\n", pvt->id);
@@ -3582,8 +3719,17 @@ static int handle_response_ciev(struct mbl_pvt *pvt, char *buf)
 			if (pvt->outgoing) {
 				ast_debug(1, "[%s] remote end answered\n", pvt->id);
 				mbl_queue_control(pvt, AST_CONTROL_ANSWER);
+				pvt->calls_answered++;
+				pvt->call_start_time = time(NULL);
+				mbl_set_call_state(pvt, MBL_CALL_ACTIVE);
+				manager_event(EVENT_FLAG_CALL, "MobileCallStart",
+					"Device: %s\r\n"
+					"Direction: Outgoing\r\n"
+					"DialedNumber: %s\r\n",
+					pvt->id, pvt->dialed_number);
 			} else if (pvt->incoming && pvt->answered) {
 				ast_setstate(pvt->owner, AST_STATE_UP);
+				mbl_set_call_state(pvt, MBL_CALL_ACTIVE);
 			} else if (pvt->incoming) {
 				/* user answered from handset, disconnecting */
 				ast_verb(3, "[%s] user answered bluetooth device from handset, disconnecting\n", pvt->id);
@@ -3611,17 +3757,25 @@ static int handle_response_ciev(struct mbl_pvt *pvt, char *buf)
 				pvt->needcallerid = 0;
 				pvt->incoming = 0;
 				pvt->outgoing = 0;
+				mbl_set_call_state(pvt, MBL_CALL_IDLE);
 			}
 			break;
 		case HFP_CIND_CALLSETUP_INCOMING:
 			ast_debug(1, "[%s] incoming call, waiting for caller id\n", pvt->id);
 			pvt->needcallerid = 1;
 			pvt->incoming = 1;
+			pvt->calls_in++;
+			mbl_set_call_state(pvt, MBL_CALL_INCOMING_WAIT_CID);
+			manager_event(EVENT_FLAG_CALL, "MobileCallIncoming",
+				"Device: %s\r\n"
+				"State: WaitingCallerID\r\n",
+				pvt->id);
 			break;
 		case HFP_CIND_CALLSETUP_OUTGOING:
 			if (pvt->outgoing) {
 				pvt->hfp->sent_alerting = 0;
 				ast_debug(1, "[%s] outgoing call\n", pvt->id);
+				mbl_set_call_state(pvt, MBL_CALL_OUTGOING_DIALING);
 			} else {
 				ast_verb(3, "[%s] user dialed from handset, disconnecting\n", pvt->id);
 				return -1;
@@ -3632,9 +3786,50 @@ static int handle_response_ciev(struct mbl_pvt *pvt, char *buf)
 				ast_debug(1, "[%s] remote alerting\n", pvt->id);
 				mbl_queue_control(pvt, AST_CONTROL_RINGING);
 				pvt->hfp->sent_alerting = 1;
+				mbl_set_call_state(pvt, MBL_CALL_OUTGOING_ALERTING);
 			}
 			break;
 		}
+		break;
+	case HFP_CIND_SIGNAL:
+		ast_debug(1, "[%s] signal strength changed to %d\n", pvt->id, i);
+		ast_verb(4, "[%s] Signal strength: %d/5\n", pvt->id, i);
+		manager_event(EVENT_FLAG_SYSTEM, "MobileSignal",
+			"Device: %s\r\n"
+			"Signal: %d\r\n",
+			pvt->id, i);
+		break;
+	case HFP_CIND_BATTCHG:
+		ast_debug(1, "[%s] battery level changed to %d\n", pvt->id, i);
+		ast_verb(4, "[%s] Battery level: %d/5\n", pvt->id, i);
+		manager_event(EVENT_FLAG_SYSTEM, "MobileBattery",
+			"Device: %s\r\n"
+			"Battery: %d\r\n",
+			pvt->id, i);
+		break;
+	case HFP_CIND_SERVICE:
+		ast_debug(1, "[%s] service indicator changed to %d\n", pvt->id, i);
+		if (i == 0) {
+			ast_verb(3, "[%s] Lost cellular service\n", pvt->id);
+		} else {
+			ast_verb(3, "[%s] Cellular service available\n", pvt->id);
+		}
+		manager_event(EVENT_FLAG_SYSTEM, "MobileService",
+			"Device: %s\r\n"
+			"Service: %d\r\n",
+			pvt->id, i);
+		break;
+	case HFP_CIND_ROAM:
+		ast_debug(1, "[%s] roaming indicator changed to %d\n", pvt->id, i);
+		if (i == 1) {
+			ast_verb(3, "[%s] Device is roaming\n", pvt->id);
+		} else {
+			ast_verb(3, "[%s] Device is not roaming\n", pvt->id);
+		}
+		manager_event(EVENT_FLAG_SYSTEM, "MobileRoaming",
+			"Device: %s\r\n"
+			"Roaming: %d\r\n",
+			pvt->id, i);
 		break;
 	case HFP_CIND_NONE:
 		ast_debug(1, "[%s] error parsing CIND: %s\n", pvt->id, buf);
@@ -3661,11 +3856,31 @@ static int handle_response_clip(struct mbl_pvt *pvt, char *buf)
 
 		pvt->needcallerid = 0;
 		cidinfo = hfp_parse_clip(pvt->hfp, buf);
+		
+		/* Store caller ID for tracking */
+		if (cidinfo.cnum && cidinfo.cnum[0]) {
+			ast_copy_string(pvt->caller_id, cidinfo.cnum, sizeof(pvt->caller_id));
+		} else {
+			ast_copy_string(pvt->caller_id, "Unknown", sizeof(pvt->caller_id));
+		}
+		
+		mbl_set_call_state(pvt, MBL_CALL_INCOMING_RING);
+		
+		/* Emit AMI event for incoming call with caller ID */
+		manager_event(EVENT_FLAG_CALL, "MobileCallIncoming",
+			"Device: %s\r\n"
+			"State: Ringing\r\n"
+			"CallerID: %s\r\n"
+			"CallerIDName: %s\r\n",
+			pvt->id, 
+			(cidinfo.cnum && cidinfo.cnum[0]) ? cidinfo.cnum : "Unknown",
+			(cidinfo.cnam && cidinfo.cnam[0]) ? cidinfo.cnam : "");
 
 		if (!(chan = mbl_new(AST_STATE_RING, pvt, &cidinfo, NULL, NULL))) {
 			ast_log(LOG_ERROR, "[%s] unable to allocate channel for incoming call\n", pvt->id);
 			hfp_send_chup(pvt->hfp);
 			msg_queue_push(pvt, AT_OK, AT_CHUP);
+			mbl_set_call_state(pvt, MBL_CALL_IDLE);
 			return -1;
 		}
 
@@ -3676,6 +3891,7 @@ static int handle_response_clip(struct mbl_pvt *pvt, char *buf)
 		if (ast_pbx_start(chan)) {
 			ast_log(LOG_ERROR, "[%s] unable to start pbx on incoming call\n", pvt->id);
 			mbl_ast_hangup(pvt);
+			mbl_set_call_state(pvt, MBL_CALL_IDLE);
 			return -1;
 		}
 	}
@@ -3720,6 +3936,7 @@ static int handle_response_cmti(struct mbl_pvt *pvt, char *buf)
 		}
 
 		pvt->incoming_sms = 1;
+		pvt->sms_in++;
 		return 0;
 	} else {
 		ast_debug(1, "[%s] error parsing incoming sms message alert, disconnecting\n", pvt->id);
@@ -3884,11 +4101,22 @@ static void *do_monitor_phone(void *data)
 	 * procedure is not spread throughout the event handling loop.
 	 */
 
+	/* Give the phone a moment to settle after RFCOMM connection before sending commands */
+	ast_debug(1, "[%s] Waiting 500ms for phone to settle after connection...\n", pvt->id);
+	usleep(500000);  /* 500ms delay */
+
 	/* start initialization with the BRSF request */
 	ast_mutex_lock(&pvt->lock);
 	pvt->timeout = 10000;
+	hfp->slc_state = HFP_SLC_CONNECTING;
+	ast_debug(1, "[%s] HFP SLC state: %s -> %s\n", pvt->id, 
+		hfp_slc_state_str(HFP_SLC_DISCONNECTED), hfp_slc_state_str(HFP_SLC_CONNECTING));
+	
+	ast_verb(3, "[%s] Sending AT+BRSF to phone (RFCOMM socket %d, port %d)...\n", 
+		pvt->id, pvt->rfcomm_socket, pvt->rfcomm_port);
+	
 	if (hfp_send_brsf(hfp, &hfp_our_brsf)  || msg_queue_push(pvt, AT_BRSF, AT_BRSF)) {
-		ast_debug(1, "[%s] error sending BRSF\n", hfp->owner->id);
+		ast_log(LOG_WARNING, "[%s] error sending BRSF command\n", hfp->owner->id);
 		goto e_cleanup;
 	}
 	ast_mutex_unlock(&pvt->lock);
@@ -3899,31 +4127,56 @@ static void *do_monitor_phone(void *data)
 		ast_mutex_unlock(&pvt->lock);
 
 		if (!rfcomm_wait(pvt->rfcomm_socket, &t)) {
-			ast_debug(1, "[%s] timeout waiting for rfcomm data, disconnecting\n", pvt->id);
 			ast_mutex_lock(&pvt->lock);
 			if (!hfp->initialized) {
+				/* Timeout during initialization - this is an error */
+				ast_debug(1, "[%s] timeout waiting for rfcomm data during init (state=%s), disconnecting\n", 
+					pvt->id, hfp_slc_state_str(hfp->slc_state));
 				if ((entry = msg_queue_head(pvt))) {
 					switch (entry->response_to) {
 					case AT_CIND_TEST:
 						if (pvt->blackberry)
-							ast_debug(1, "[%s] timeout during CIND test\n", hfp->owner->id);
+							ast_log(LOG_WARNING, "[%s] timeout during CIND test\n", hfp->owner->id);
 						else
-							ast_debug(1, "[%s] timeout during CIND test, try setting 'blackberry=yes'\n", hfp->owner->id);
+							ast_log(LOG_WARNING, "[%s] timeout during CIND test, try setting 'blackberry=yes'\n", hfp->owner->id);
+						snprintf(pvt->last_disconnect_reason, sizeof(pvt->last_disconnect_reason),
+							"Timeout during CIND test");
 						break;
 					case AT_CMER:
 						if (pvt->blackberry)
-							ast_debug(1, "[%s] timeout after sending CMER, try setting 'blackberry=no'\n", hfp->owner->id);
+							ast_log(LOG_WARNING, "[%s] timeout after sending CMER, try setting 'blackberry=no'\n", hfp->owner->id);
 						else
-							ast_debug(1, "[%s] timeout after sending CMER\n", hfp->owner->id);
+							ast_log(LOG_WARNING, "[%s] timeout after sending CMER\n", hfp->owner->id);
+						snprintf(pvt->last_disconnect_reason, sizeof(pvt->last_disconnect_reason),
+							"Timeout during CMER");
+						break;
+					case AT_BRSF:
+						ast_log(LOG_WARNING, "[%s] timeout waiting for BRSF response - device may not support HFP\n", pvt->id);
+						snprintf(pvt->last_disconnect_reason, sizeof(pvt->last_disconnect_reason),
+							"Timeout waiting for BRSF (no HFP support?)");
 						break;
 					default:
 						ast_debug(1, "[%s] timeout while waiting for %s in response to %s\n", pvt->id, at_msg2str(entry->expected), at_msg2str(entry->response_to));
+						snprintf(pvt->last_disconnect_reason, sizeof(pvt->last_disconnect_reason),
+							"Timeout waiting for %s", at_msg2str(entry->expected));
 						break;
 					}
 				}
+				ast_mutex_unlock(&pvt->lock);
+				goto e_cleanup;
+			}
+			/* Timeout after initialization - send keepalive to check connection */
+			ast_debug(2, "[%s] keepalive timeout, checking connection\n", pvt->id);
+			/* Try to read CIND state as a keepalive - if it fails, connection is dead */
+			if (hfp_send_cind(hfp)) {
+				ast_debug(1, "[%s] keepalive failed, connection appears dead\n", pvt->id);
+				snprintf(pvt->last_disconnect_reason, sizeof(pvt->last_disconnect_reason),
+					"Keepalive failed - connection dead");
+				ast_mutex_unlock(&pvt->lock);
+				goto e_cleanup;
 			}
 			ast_mutex_unlock(&pvt->lock);
-			goto e_cleanup;
+			continue;
 		}
 
 		if ((at_msg = at_read_full(hfp->rsock, buf, sizeof(buf))) < 0) {
@@ -4073,10 +4326,20 @@ static void *do_monitor_phone(void *data)
 
 e_cleanup:
 
-	if (!hfp->initialized)
-		ast_verb(3, "Error initializing Bluetooth device %s.\n", pvt->id);
-
 	ast_mutex_lock(&pvt->lock);
+	
+	/* Set disconnect reason based on state */
+	if (!hfp->initialized) {
+		ast_verb(3, "Error initializing Bluetooth device %s.\n", pvt->id);
+		snprintf(pvt->last_disconnect_reason, sizeof(pvt->last_disconnect_reason), 
+			"HFP init failed (state=%s)", hfp_slc_state_str(hfp->slc_state));
+	} else {
+		snprintf(pvt->last_disconnect_reason, sizeof(pvt->last_disconnect_reason), 
+			"Connection lost");
+	}
+	pvt->last_disconnect_time = time(NULL);
+	hfp->slc_state = HFP_SLC_DISCONNECTED;
+	
 	if (pvt->owner) {
 		ast_debug(1, "[%s] device disconnected, hanging up owner\n", pvt->id);
 		pvt->needchup = 0;
@@ -4084,8 +4347,10 @@ e_cleanup:
 	}
 
 	close(pvt->rfcomm_socket);
-	close(pvt->sco_socket);
-	pvt->sco_socket = -1;
+	pvt->rfcomm_socket = -1;
+	
+	/* Safely close SCO socket - remove from io_context first */
+	mbl_io_remove_sco_locked(pvt);
 
 	msg_queue_flush(pvt);
 
@@ -4095,8 +4360,12 @@ e_cleanup:
 	pvt->adapter->inuse = 0;
 	ast_mutex_unlock(&pvt->lock);
 
-	ast_verb(3, "Bluetooth Device %s has disconnected.\n", pvt->id);
-	manager_event(EVENT_FLAG_SYSTEM, "MobileStatus", "Status: Disconnect\r\nDevice: %s\r\n", pvt->id);
+	ast_verb(3, "Bluetooth Device %s has disconnected (%s).\n", pvt->id, pvt->last_disconnect_reason);
+	manager_event(EVENT_FLAG_SYSTEM, "MobileStatus", 
+		"Status: Disconnect\r\n"
+		"Device: %s\r\n"
+		"Reason: %s\r\n",
+		pvt->id, pvt->last_disconnect_reason);
 
 	return NULL;
 }
@@ -4234,15 +4503,22 @@ static void *do_monitor_headset(void *data)
 
 e_cleanup:
 	ast_mutex_lock(&pvt->lock);
+	
+	/* Set disconnect reason */
+	snprintf(pvt->last_disconnect_reason, sizeof(pvt->last_disconnect_reason), 
+		"Headset connection lost");
+	pvt->last_disconnect_time = time(NULL);
+	
 	if (pvt->owner) {
 		ast_debug(1, "[%s] device disconnected, hanging up owner\n", pvt->id);
 		mbl_queue_hangup(pvt);
 	}
 
-
 	close(pvt->rfcomm_socket);
-	close(pvt->sco_socket);
-	pvt->sco_socket = -1;
+	pvt->rfcomm_socket = -1;
+	
+	/* Safely close SCO socket - remove from io_context first */
+	mbl_io_remove_sco_locked(pvt);
 
 	pvt->connected = 0;
 
@@ -4253,8 +4529,12 @@ e_cleanup:
 	pvt->adapter->inuse = 0;
 	ast_mutex_unlock(&pvt->lock);
 
-	manager_event(EVENT_FLAG_SYSTEM, "MobileStatus", "Status: Disconnect\r\nDevice: %s\r\n", pvt->id);
-	ast_verb(3, "Bluetooth Device %s has disconnected\n", pvt->id);
+	manager_event(EVENT_FLAG_SYSTEM, "MobileStatus", 
+		"Status: Disconnect\r\n"
+		"Device: %s\r\n"
+		"Reason: %s\r\n",
+		pvt->id, pvt->last_disconnect_reason);
+	ast_verb(3, "Bluetooth Device %s has disconnected (%s)\n", pvt->id, pvt->last_disconnect_reason);
 
 	return NULL;
 
@@ -4281,13 +4561,22 @@ static int start_monitor(struct mbl_pvt *pvt)
 
 }
 
+/* Connection retry constants */
+#define CONNECT_BACKOFF_MIN 5       /*!< Minimum backoff in seconds */
+#define CONNECT_BACKOFF_MAX 300     /*!< Maximum backoff in seconds (5 minutes) */
+#define CONNECT_BACKOFF_MULTIPLIER 2 /*!< Backoff multiplier on each failure */
+
 static void *do_discovery(void *data)
 {
 
 	struct adapter_pvt *adapter;
 	struct mbl_pvt *pvt;
+	time_t now;
+	char bdaddr[18];
 
 	while (!check_unloading()) {
+		now = time(NULL);
+		
 		AST_RWLIST_RDLOCK(&adapters);
 		AST_RWLIST_TRAVERSE(&adapters, adapter, entry) {
 			if (!adapter->inuse) {
@@ -4295,13 +4584,67 @@ static void *do_discovery(void *data)
 				AST_RWLIST_TRAVERSE(&devices, pvt, entry) {
 					ast_mutex_lock(&pvt->lock);
 					if (!adapter->inuse && !pvt->connected && !strcmp(adapter->id, pvt->adapter->id)) {
+						/* Check if we should skip this device due to backoff */
+						if (pvt->backoff_seconds > 0 && 
+						    (now - pvt->last_connect_attempt) < pvt->backoff_seconds) {
+							ast_debug(2, "[%s] Skipping connection attempt (backoff %ds, %lds remaining)\n",
+								pvt->id, pvt->backoff_seconds,
+								(long)(pvt->backoff_seconds - (now - pvt->last_connect_attempt)));
+							ast_mutex_unlock(&pvt->lock);
+							continue;
+						}
+						
+						pvt->last_connect_attempt = now;
+						ba2str(&pvt->addr, bdaddr);
+						ast_debug(1, "[%s] Attempting RFCOMM connection to %s (attempt %d)\n", 
+							pvt->id, bdaddr, pvt->connect_failures + 1);
+						
 						if ((pvt->rfcomm_socket = rfcomm_connect(adapter->addr, pvt->addr, pvt->rfcomm_port)) > -1) {
 							if (start_monitor(pvt)) {
 								pvt->connected = 1;
 								adapter->inuse = 1;
-								manager_event(EVENT_FLAG_SYSTEM, "MobileStatus", "Status: Connect\r\nDevice: %s\r\n", pvt->id);
+								/* Reset backoff on successful connection */
+								pvt->connect_failures = 0;
+								pvt->backoff_seconds = 0;
+								pvt->connected_since = time(NULL);
+								manager_event(EVENT_FLAG_SYSTEM, "MobileStatus", 
+									"Status: Connect\r\n"
+									"Device: %s\r\n"
+									"Address: %s\r\n",
+									pvt->id, bdaddr);
 								ast_verb(3, "Bluetooth Device %s has connected, initializing...\n", pvt->id);
+							} else {
+								/* start_monitor failed, close socket */
+								close(pvt->rfcomm_socket);
+								pvt->rfcomm_socket = -1;
+								pvt->connect_failures++;
+								manager_event(EVENT_FLAG_SYSTEM, "MobileStatus",
+									"Status: ConnectFailed\r\n"
+									"Device: %s\r\n"
+									"Reason: MonitorStartFailed\r\n"
+									"Failures: %d\r\n",
+									pvt->id, pvt->connect_failures);
 							}
+						} else {
+							/* Connection failed - apply exponential backoff */
+							pvt->connect_failures++;
+							if (pvt->backoff_seconds == 0) {
+								pvt->backoff_seconds = CONNECT_BACKOFF_MIN;
+							} else {
+								pvt->backoff_seconds *= CONNECT_BACKOFF_MULTIPLIER;
+								if (pvt->backoff_seconds > CONNECT_BACKOFF_MAX) {
+									pvt->backoff_seconds = CONNECT_BACKOFF_MAX;
+								}
+							}
+							ast_debug(1, "[%s] Connection failed (failures=%d), backoff=%ds\n",
+								pvt->id, pvt->connect_failures, pvt->backoff_seconds);
+							manager_event(EVENT_FLAG_SYSTEM, "MobileStatus",
+								"Status: ConnectFailed\r\n"
+								"Device: %s\r\n"
+								"Reason: RFCOMMFailed\r\n"
+								"Failures: %d\r\n"
+								"BackoffSeconds: %d\r\n",
+								pvt->id, pvt->connect_failures, pvt->backoff_seconds);
 						}
 					}
 					ast_mutex_unlock(&pvt->lock);
@@ -4321,29 +4664,182 @@ static void *do_discovery(void *data)
 }
 
 /*!
+ * \brief Rebuild the accept_io context after an error
+ * \param adapter Adapter private structure
+ * \return 0 on success, -1 on error
+ */
+static int rebuild_accept_io_context(struct adapter_pvt *adapter)
+{
+	struct io_context *new_io;
+	struct io_context *old_io;
+	int *new_id;
+	
+	ast_mutex_lock(&adapter->lock);
+	
+	/* Create new context */
+	new_io = io_context_create();
+	if (!new_io) {
+		ast_log(LOG_ERROR, "[%s] Failed to create new accept_io context\n", adapter->id);
+		ast_mutex_unlock(&adapter->lock);
+		return -1;
+	}
+	
+	/* Re-add listener socket if still valid */
+	if (adapter->sco_socket != -1 && fcntl(adapter->sco_socket, F_GETFD) != -1) {
+		new_id = ast_io_add(new_io, adapter->sco_socket, sco_accept, AST_IO_IN, adapter);
+		if (!new_id) {
+			ast_log(LOG_ERROR, "[%s] Failed to re-add SCO listener to new context\n", adapter->id);
+			io_context_destroy(new_io);
+			ast_mutex_unlock(&adapter->lock);
+			return -1;
+		}
+		adapter->sco_id = new_id;
+		ast_log(LOG_NOTICE, "[%s] Rebuilt accept_io context, re-registered SCO listener\n",
+		        adapter->id);
+	} else {
+		ast_log(LOG_WARNING, "[%s] SCO listener socket invalid (fd=%d), cannot rebuild\n",
+		        adapter->id, adapter->sco_socket);
+		io_context_destroy(new_io);
+		ast_mutex_unlock(&adapter->lock);
+		return -1;
+	}
+	
+	/* Swap contexts atomically */
+	old_io = adapter->accept_io;
+	adapter->accept_io = new_io;
+	ast_mutex_unlock(&adapter->lock);
+	
+	/* Destroy old context (outside lock to avoid deadlock) */
+	io_context_destroy(old_io);
+	
+	return 0;
+}
+
+/*!
+ * \brief Rebuild the audio io context after an error
+ * \param adapter Adapter private structure
+ * \return 0 on success, -1 on error
+ */
+static int rebuild_audio_io_context(struct adapter_pvt *adapter)
+{
+	struct io_context *new_io;
+	struct io_context *old_io;
+	
+	/* Create new context */
+	new_io = io_context_create();
+	if (!new_io) {
+		ast_log(LOG_ERROR, "[%s] Failed to create new audio io context\n", adapter->id);
+		return -1;
+	}
+	
+	/* Note: Device SCO sockets are not currently registered in adapter->io
+	 * in the original code, so we just need to swap the context.
+	 * If device SCO sockets were registered, we would need to re-add them here.
+	 */
+	
+	ast_log(LOG_NOTICE, "[%s] Rebuilt audio io context\n", adapter->id);
+	
+	/* Swap contexts */
+	ast_mutex_lock(&adapter->lock);
+	old_io = adapter->io;
+	adapter->io = new_io;
+	ast_mutex_unlock(&adapter->lock);
+	
+	/* Destroy old context */
+	io_context_destroy(old_io);
+	
+	return 0;
+}
+
+/*!
  * \brief Service new and existing SCO connections.
  * This thread accepts new sco connections and handles audio data.  There is
  * one do_sco_listen thread for each adapter.
+ * 
+ * \note This function is now resilient to transient errors and will attempt
+ * to rebuild io_contexts on EBADF/EINVAL errors instead of exiting.
  */
 static void *do_sco_listen(void *data)
 {
 	struct adapter_pvt *adapter = (struct adapter_pvt *) data;
+	int consecutive_errors = 0;
+	const int MAX_CONSECUTIVE_ERRORS = 10;
+	const int BACKOFF_MS = 100;
 
 	while (!check_unloading()) {
+		int ret_accept, ret_audio;
+		int err;
+		
 		/* check for new sco connections */
-		if (ast_io_wait(adapter->accept_io, 0) == -1) {
-			/* handle errors */
-			ast_log(LOG_ERROR, "ast_io_wait() failed for adapter %s\n", adapter->id);
-			break;
+		ret_accept = ast_io_wait(adapter->accept_io, 0);
+		if (ret_accept == -1) {
+			err = errno;
+			
+			/* EINTR is normal (signal interrupted), just retry */
+			if (err == EINTR) {
+				continue;
+			}
+			
+			ast_log(LOG_ERROR, "[%s] ast_io_wait(accept_io) failed: %s (errno=%d)\n",
+			        adapter->id, strerror(err), err);
+			
+			if (err == EBADF || err == EINVAL) {
+				/* Try to rebuild the io_context */
+				if (rebuild_accept_io_context(adapter) < 0) {
+					ast_log(LOG_ERROR, "[%s] Failed to rebuild accept_io, exiting listener\n",
+					        adapter->id);
+					break;
+				}
+				consecutive_errors = 0; /* Reset on successful rebuild */
+			} else {
+				consecutive_errors++;
+				if (consecutive_errors >= MAX_CONSECUTIVE_ERRORS) {
+					ast_log(LOG_ERROR, "[%s] Too many consecutive errors (%d), exiting listener\n",
+					        adapter->id, consecutive_errors);
+					break;
+				}
+				usleep(BACKOFF_MS * 1000);
+			}
+			continue;
 		}
 
 		/* handle audio data */
-		if (ast_io_wait(adapter->io, 1) == -1) {
-			ast_log(LOG_ERROR, "ast_io_wait() failed for audio on adapter %s\n", adapter->id);
-			break;
+		ret_audio = ast_io_wait(adapter->io, 1);
+		if (ret_audio == -1) {
+			err = errno;
+			
+			/* EINTR is normal (signal interrupted), just retry */
+			if (err == EINTR) {
+				continue;
+			}
+			
+			ast_log(LOG_ERROR, "[%s] ast_io_wait(io) failed: %s (errno=%d)\n",
+			        adapter->id, strerror(err), err);
+			
+			if (err == EBADF || err == EINVAL) {
+				/* Try to rebuild the io_context */
+				if (rebuild_audio_io_context(adapter) < 0) {
+					ast_log(LOG_ERROR, "[%s] Failed to rebuild audio io, exiting listener\n",
+					        adapter->id);
+					break;
+				}
+				consecutive_errors = 0;
+			} else {
+				consecutive_errors++;
+				if (consecutive_errors >= MAX_CONSECUTIVE_ERRORS) {
+					ast_log(LOG_ERROR, "[%s] Too many consecutive errors (%d), exiting listener\n",
+					        adapter->id, consecutive_errors);
+					break;
+				}
+				usleep(BACKOFF_MS * 1000);
+			}
+			continue;
 		}
+		
+		consecutive_errors = 0; /* Reset on success */
 	}
 
+	ast_debug(1, "[%s] SCO listener thread exiting\n", adapter->id);
 	return NULL;
 }
 
@@ -4388,6 +4884,9 @@ static struct adapter_pvt *mbl_load_adapter(struct ast_config *cfg, const char *
 
 	ast_copy_string(adapter->id, id, sizeof(adapter->id));
 	str2ba(address, &adapter->addr);
+	ast_mutex_init(&adapter->lock);
+	adapter->sco_id = NULL;
+	adapter->sco_socket = -1;
 
 	/* attempt to connect to the adapter */
 	adapter->dev_id = hci_devid(address);
@@ -4458,9 +4957,15 @@ static struct adapter_pvt *mbl_load_adapter(struct ast_config *cfg, const char *
 	return adapter;
 
 e_remove_sco:
-	ast_io_remove(adapter->accept_io, adapter->sco_id);
+	if (adapter->sco_id) {
+		ast_io_remove(adapter->accept_io, adapter->sco_id);
+		adapter->sco_id = NULL;
+	}
 e_close_sco:
-	close(adapter->sco_socket);
+	if (adapter->sco_socket != -1) {
+		close(adapter->sco_socket);
+		adapter->sco_socket = -1;
+	}
 e_destroy_io:
 	io_context_destroy(adapter->io);
 e_destroy_accept_io:
@@ -4468,6 +4973,7 @@ e_destroy_accept_io:
 e_hci_close_dev:
 	hci_close_dev(adapter->hci_socket);
 e_free_adapter:
+	ast_mutex_destroy(&adapter->lock);
 	ast_free(adapter);
 e_return:
 	return NULL;
@@ -4534,6 +5040,7 @@ static struct mbl_pvt *mbl_load_device(struct ast_config *cfg, const char *cat)
 	pvt->rfcomm_socket = -1;
 	pvt->rfcomm_port = atoi(port);
 	pvt->sco_socket = -1;
+	pvt->sco_io_id = NULL;  /* Not registered in io_context yet */
 	pvt->monitor_thread = AST_PTHREADT_NULL;
 	pvt->ring_sched_id = -1;
 	pvt->has_sms = 1;
@@ -4739,8 +5246,14 @@ static int unload_module(void)
 			pthread_join(pvt->monitor_thread, NULL);
 		}
 
-		close(pvt->sco_socket);
-		close(pvt->rfcomm_socket);
+		/* Safe SCO cleanup: remove from io_context then close */
+		mbl_io_remove_sco(pvt);
+		
+		/* RFCOMM socket cleanup */
+		if (pvt->rfcomm_socket != -1) {
+			close(pvt->rfcomm_socket);
+			pvt->rfcomm_socket = -1;
+		}
 
 		msg_queue_flush(pvt);
 
@@ -4759,10 +5272,19 @@ static int unload_module(void)
 	/* Destroy the adapter list */
 	AST_RWLIST_WRLOCK(&adapters);
 	while ((adapter = AST_RWLIST_REMOVE_HEAD(&adapters, entry))) {
-		close(adapter->sco_socket);
+		/* Safely remove SCO listener from io_context before closing */
+		if (adapter->sco_id && adapter->accept_io) {
+			ast_io_remove(adapter->accept_io, adapter->sco_id);
+			adapter->sco_id = NULL;
+		}
+		if (adapter->sco_socket != -1) {
+			close(adapter->sco_socket);
+			adapter->sco_socket = -1;
+		}
 		io_context_destroy(adapter->io);
 		io_context_destroy(adapter->accept_io);
 		hci_close_dev(adapter->hci_socket);
+		ast_mutex_destroy(&adapter->lock);
 		ast_free(adapter);
 	}
 	AST_RWLIST_UNLOCK(&adapters);
@@ -4779,8 +5301,14 @@ static int load_module(void)
 {
 
 	int dev_id, s;
+	struct adapter_pvt *adapter;
+	struct mbl_pvt *pvt;
+	int adapter_count = 0, device_count = 0;
+
+	ast_log(LOG_NOTICE, "chan_mobile: Loading module (modernized version with FD lifecycle fixes)\n");
 
 	if (!(mbl_tech.capabilities = ast_format_cap_alloc(AST_FORMAT_CAP_FLAG_DEFAULT))) {
+		ast_log(LOG_ERROR, "chan_mobile: Failed to allocate capabilities\n");
 		return AST_MODULE_LOAD_DECLINE;
 	}
 
@@ -4790,39 +5318,71 @@ static int load_module(void)
 
 	s = hci_open_dev(dev_id);
 	if (dev_id < 0 || s < 0) {
-		ast_log(LOG_ERROR, "No Bluetooth devices found. Not loading module.\n");
+		ast_log(LOG_ERROR, "chan_mobile: No Bluetooth devices found (dev_id=%d). Not loading module.\n", dev_id);
 		ao2_ref(mbl_tech.capabilities, -1);
 		mbl_tech.capabilities = NULL;
 		hci_close_dev(s);
 		return AST_MODULE_LOAD_DECLINE;
 	}
 
+	ast_log(LOG_NOTICE, "chan_mobile: Found Bluetooth device hci%d\n", dev_id);
 	hci_close_dev(s);
 
 	if (mbl_load_config()) {
-		ast_log(LOG_ERROR, "Errors reading config file %s. Not loading module.\n", MBL_CONFIG);
+		ast_log(LOG_ERROR, "chan_mobile: Errors reading config file %s. Not loading module.\n", MBL_CONFIG);
 		ao2_ref(mbl_tech.capabilities, -1);
 		mbl_tech.capabilities = NULL;
 		return AST_MODULE_LOAD_DECLINE;
 	}
 
+	/* Count and log loaded adapters */
+	AST_RWLIST_RDLOCK(&adapters);
+	AST_RWLIST_TRAVERSE(&adapters, adapter, entry) {
+		ast_log(LOG_NOTICE, "chan_mobile: Adapter '%s' loaded (hci%d, sco_socket=%d)\n",
+			adapter->id, adapter->dev_id, adapter->sco_socket);
+		adapter_count++;
+	}
+	AST_RWLIST_UNLOCK(&adapters);
+
+	/* Count and log loaded devices */
+	AST_RWLIST_RDLOCK(&devices);
+	AST_RWLIST_TRAVERSE(&devices, pvt, entry) {
+		char addr_str[18];
+		ba2str(&pvt->addr, addr_str);
+		ast_log(LOG_NOTICE, "chan_mobile: Device '%s' loaded (addr=%s, adapter=%s, sms=%s)\n",
+			pvt->id, addr_str, pvt->adapter ? pvt->adapter->id : "(none)", pvt->has_sms ? "yes" : "no");
+		device_count++;
+	}
+	AST_RWLIST_UNLOCK(&devices);
+
+	ast_log(LOG_NOTICE, "chan_mobile: Loaded %d adapter(s) and %d device(s) from config\n",
+		adapter_count, device_count);
+
 	sdp_session = sdp_register();
+	if (sdp_session) {
+		ast_log(LOG_NOTICE, "chan_mobile: SDP service registered successfully\n");
+	} else {
+		ast_log(LOG_WARNING, "chan_mobile: SDP registration failed (need root?), incoming connections may not work\n");
+	}
 
 	/* Spin the discovery thread */
 	if (ast_pthread_create_background(&discovery_thread, NULL, do_discovery, NULL) < 0) {
-		ast_log(LOG_ERROR, "Unable to create discovery thread.\n");
+		ast_log(LOG_ERROR, "chan_mobile: Unable to create discovery thread.\n");
 		goto e_cleanup;
 	}
+	ast_log(LOG_NOTICE, "chan_mobile: Discovery thread started\n");
 
 	/* register our channel type */
 	if (ast_channel_register(&mbl_tech)) {
-		ast_log(LOG_ERROR, "Unable to register channel class %s\n", "Mobile");
+		ast_log(LOG_ERROR, "chan_mobile: Unable to register channel class %s\n", "Mobile");
 		goto e_cleanup;
 	}
 
 	ast_cli_register_multiple(mbl_cli, sizeof(mbl_cli) / sizeof(mbl_cli[0]));
 	ast_register_application(app_mblstatus, mbl_status_exec, mblstatus_synopsis, mblstatus_desc);
 	ast_register_application(app_mblsendsms, mbl_sendsms_exec, mblsendsms_synopsis, mblsendsms_desc);
+
+	ast_log(LOG_NOTICE, "chan_mobile: Module loaded successfully\n");
 
 	return AST_MODULE_LOAD_SUCCESS;
 

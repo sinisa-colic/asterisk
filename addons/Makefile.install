@@ -1,0 +1,130 @@
+#
+# Makefile for compiling, installing, and loading chan_mobile.so
+# Usage: make -f Makefile.install [all|compile|install|load|reload]
+#
+
+# Colors for output
+GREEN = \033[0;32m
+YELLOW = \033[1;33m
+RED = \033[0;31m
+NC = \033[0m # No Color
+
+# Module name
+MODULE := chan_mobile
+MODULE_SO := $(MODULE).so
+
+# Get module directory from running Asterisk
+ASTERISK_MODDIR := $(shell asterisk -rx "core show settings" 2>/dev/null | awk -F': ' '/Module Directory/ {print $2}')
+ifeq ($(ASTERISK_MODDIR),)
+    # Fallback to common locations
+    ifneq ($(wildcard /usr/lib/asterisk/modules),)
+        ASTERISK_MODDIR := /usr/lib/asterisk/modules
+    else ifneq ($(wildcard /usr/lib64/asterisk/modules),)
+        ASTERISK_MODDIR := /usr/lib64/asterisk/modules
+    else ifneq ($(wildcard /usr/local/lib/asterisk/modules),)
+        ASTERISK_MODDIR := /usr/local/lib/asterisk/modules
+    else
+        ASTERISK_MODDIR := /usr/lib/asterisk/modules
+    endif
+endif
+
+# Default target
+.PHONY: all compile install load reload verify clean help
+
+all: compile install load
+	@echo "$(GREEN)✓ All done!$(NC)"
+
+# Compile using the standard Asterisk build system
+compile:
+	@echo "$(YELLOW)Compiling $(MODULE_SO) using Asterisk build system...$(NC)"
+	@cd .. && $(MAKE) addons
+	@if [ -f "$(MODULE_SO)" ]; then \
+		echo "$(GREEN)✓ Module compiled: $(MODULE_SO)$(NC)"; \
+		ls -lh $(MODULE_SO); \
+	else \
+		echo "$(RED)✗ Compilation failed$(NC)"; \
+		exit 1; \
+	fi
+
+# Install the module
+install: $(MODULE_SO)
+	@echo "$(YELLOW)Installing $(MODULE_SO) to $(ASTERISK_MODDIR)...$(NC)"
+	@if [ -z "$(ASTERISK_MODDIR)" ]; then \
+		echo "$(RED)Error: Could not determine Asterisk module directory$(NC)"; \
+		exit 1; \
+	fi
+	@if [ ! -f "$(MODULE_SO)" ]; then \
+		echo "$(RED)Error: $(MODULE_SO) not found. Run 'make -f Makefile.install compile' first$(NC)"; \
+		exit 1; \
+	fi
+	@if [ -f "$(ASTERISK_MODDIR)/$(MODULE_SO)" ]; then \
+		echo "$(YELLOW)Backing up existing module...$(NC)"; \
+		sudo cp -a "$(ASTERISK_MODDIR)/$(MODULE_SO)" "$(ASTERISK_MODDIR)/$(MODULE_SO).backup.$$(date +%Y%m%d_%H%M%S)"; \
+	fi
+	@sudo install -m 0644 $(MODULE_SO) "$(ASTERISK_MODDIR)/$(MODULE_SO)"
+	@sudo chown root:root "$(ASTERISK_MODDIR)/$(MODULE_SO)" 2>/dev/null || true
+	@echo "$(GREEN)✓ Module installed$(NC)"
+
+# Load the module in Asterisk
+load: install
+	@echo "$(YELLOW)Loading module in Asterisk...$(NC)"
+	@if asterisk -rx "module unload $(MODULE_SO)" 2>&1 | grep -q "not loaded"; then \
+		echo "$(YELLOW)Module was not loaded (this is fine)$(NC)"; \
+	fi
+	@asterisk -rx "module load $(MODULE_SO)" 2>&1 || true
+	@echo "$(YELLOW)Module status:$(NC)"
+	@asterisk -rx "module show like $(MODULE)" 2>&1 || true
+	@echo "$(GREEN)✓ Module loaded$(NC)"
+
+# Reload the module
+reload: install
+	@echo "$(YELLOW)Reloading module in Asterisk...$(NC)"
+	@asterisk -rx "module reload $(MODULE_SO)" 2>&1 || asterisk -rx "module load $(MODULE_SO)" 2>&1 || true
+	@echo "$(GREEN)✓ Module reloaded$(NC)"
+
+# Verify installation
+verify:
+	@echo "$(YELLOW)Verifying installation...$(NC)"
+	@echo ""
+	@echo "1. Source module:"
+	@if [ -f "$(MODULE_SO)" ]; then \
+		ls -lh $(MODULE_SO); \
+	else \
+		echo "$(RED)Source module not found$(NC)"; \
+	fi
+	@echo ""
+	@if [ -f "$(ASTERISK_MODDIR)/$(MODULE_SO)" ]; then \
+		echo "2. Installed module:"; \
+		ls -lh "$(ASTERISK_MODDIR)/$(MODULE_SO)"; \
+		echo ""; \
+		echo "3. Module status in Asterisk:"; \
+		asterisk -rx "module show like $(MODULE)" 2>&1 || true; \
+		echo ""; \
+		echo "4. Asterisk version:"; \
+		asterisk -rx "core show version" 2>/dev/null | head -1 || true; \
+	else \
+		echo "$(RED)Module not found in $(ASTERISK_MODDIR)$(NC)"; \
+	fi
+
+# Clean build artifacts
+clean:
+	@echo "$(YELLOW)Cleaning build artifacts...$(NC)"
+	@$(MAKE) -f Makefile clean 2>/dev/null || true
+	@rm -f $(MODULE_SO) chan_mobile.o .chan_mobile.o.d
+	@echo "$(GREEN)✓ Cleaned$(NC)"
+
+# Help
+help:
+	@echo "Usage: make -f Makefile.install [target]"
+	@echo ""
+	@echo "Targets:"
+	@echo "  all      - Compile, install, and load the module (default)"
+	@echo "  compile  - Compile chan_mobile.so using Asterisk build system"
+	@echo "  install  - Install chan_mobile.so to Asterisk module directory"
+	@echo "  load     - Load the module in Asterisk"
+	@echo "  reload   - Reload the module in Asterisk"
+	@echo "  verify   - Verify the installation"
+	@echo "  clean    - Remove build artifacts"
+	@echo "  help     - Show this help message"
+	@echo ""
+	@echo "Module directory: $(ASTERISK_MODDIR)"
