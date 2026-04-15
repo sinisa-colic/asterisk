@@ -4170,8 +4170,27 @@ static pj_bool_t session_on_rx_response(pjsip_rx_data *rdata)
 	pjsip_dialog *dlg = pjsip_rdata_get_dlg(rdata);
 	pjsip_inv_session *inv_session = dlg ? pjsip_dlg_get_inv_session(dlg) : NULL;
 	struct ast_sip_session *session = (inv_session ? inv_session->mod_data[session_module.id] : NULL);
-	SCOPE_ENTER(1, "%s Method: %.*s Status: %d\n", ast_sip_session_get_name(session),
+	const char *session_name = ast_sip_session_get_name(session);
+
+	SCOPE_ENTER(1, "%s Method: %.*s Status: %d\n", session_name,
 		(int)rdata->msg_info.cseq->method.name.slen, rdata->msg_info.cseq->method.name.ptr, status.code);
+
+	if (status.code >= 400) {
+		pjsip_msg_body *body = rdata->msg_info.msg->body;
+		ast_log(LOG_NOTICE, "%s: Received SIP %d %.*s from peer\n", session_name,
+			status.code, (int)pj_strlen(&status.reason), pj_strbuf(&status.reason));
+		if (body && body->data && body->len > 0 && body->len <= 1024) {
+			int skip = (pj_stricmp2(&body->content_type.type, "application") == 0
+				&& pj_stricmp2(&body->content_type.subtype, "sdp") == 0);
+			if (!skip && (pj_stricmp2(&body->content_type.type, "text") == 0
+					|| pj_stricmp2(&body->content_type.type, "application") == 0)) {
+				ast_log(LOG_NOTICE, "%s: Response body (%.*s/%.*s): %.*s\n", session_name,
+					(int)pj_strlen(&body->content_type.type), pj_strbuf(&body->content_type.type),
+					(int)pj_strlen(&body->content_type.subtype), pj_strbuf(&body->content_type.subtype),
+					(int)body->len, (const char *)body->data);
+			}
+		}
+	}
 
 	SCOPE_EXIT_RTN_VALUE(PJ_FALSE);
 }
@@ -4475,8 +4494,21 @@ static void handle_outgoing_request(struct ast_sip_session *session, pjsip_tx_da
 {
 	struct ast_sip_session_supplement *supplement;
 	struct pjsip_request_line req = tdata->msg->line.req;
+	char req_uri_buf[512];
+	int req_uri_len;
+
 	SCOPE_ENTER(3, "%s: Method is %.*s\n", ast_sip_session_get_name(session),
 		(int) pj_strlen(&req.method.name), pj_strbuf(&req.method.name));
+
+	/* Log outgoing INVITE Request-URI for debugging (e.g. OpenAI project ID in RURI) */
+	if (req.method.id == PJSIP_INVITE_METHOD) {
+		req_uri_len = pjsip_uri_print(PJSIP_URI_IN_REQ_URI, req.uri, req_uri_buf, sizeof(req_uri_buf) - 1);
+		if (req_uri_len > 0) {
+			req_uri_buf[req_uri_len] = '\0';
+			ast_log(LOG_NOTICE, "%s: Outgoing INVITE Request-URI: %s\n",
+				ast_sip_session_get_name(session), req_uri_buf);
+		}
+	}
 
 	ast_sip_message_apply_transport(session->endpoint->transport, tdata);
 
