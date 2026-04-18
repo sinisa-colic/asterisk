@@ -1077,6 +1077,11 @@ static struct ao2_container *cli_contact_get_container(const char *regex)
 	return contacts_container;
 }
 
+struct ao2_container *ast_sip_get_ami_contact_list_container(const char *regex)
+{
+	return cli_contact_get_container(regex);
+}
+
 static void *cli_contact_retrieve_by_id(const char *id)
 {
 	struct ao2_container *container;

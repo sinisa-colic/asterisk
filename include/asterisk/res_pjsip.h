@@ -3236,6 +3236,16 @@ struct ast_sip_ami {
 };
 
 /*!
+ * \brief Contact container matching CLI \c pjsip show contacts.
+ *
+ * Includes registrar contacts and permanent AOR contacts. Container holds
+ * ast_sip_contact_wrapper objects; use the \c contact field for the ast_sip_contact.
+ *
+ * \param regex Optional filter (empty string for all).
+ */
+struct ao2_container *ast_sip_get_ami_contact_list_container(const char *regex);
+
+/*!
  * \brief Creates a string to store AMI event data in.
  *
  * \param event the event to set

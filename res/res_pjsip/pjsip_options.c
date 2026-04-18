@@ -2408,16 +2408,6 @@ static char *cli_qualify(struct ast_cli_entry *e, int cmd, struct ast_cli_args *
 	return CLI_SUCCESS;
 }
 
-static struct ao2_container *get_all_contacts(void)
-{
-	struct ao2_container *contacts;
-
-	contacts = ast_sorcery_retrieve_by_fields(ast_sip_get_sorcery(), "contact",
-			AST_RETRIEVE_FLAG_MULTIPLE | AST_RETRIEVE_FLAG_ALL, NULL);
-
-	return contacts;
-}
-
 static int sip_contact_to_ami(const struct ast_sip_contact *contact,
 			   struct ast_str **buf)
 {
@@ -2426,7 +2416,8 @@ static int sip_contact_to_ami(const struct ast_sip_contact *contact,
 
 static int format_ami_contactlist_handler(void *obj, void *arg, int flags)
 {
-	struct ast_sip_contact *contact = obj;
+	struct ast_sip_contact_wrapper *wrapper = obj;
+	struct ast_sip_contact *contact = wrapper->contact;
 	struct ast_sip_ami *ami = arg;
 	struct ast_str *buf;
 	struct ast_sip_contact_status *status;
@@ -2441,7 +2432,7 @@ static int format_ami_contactlist_handler(void *obj, void *arg, int flags)
 
 	if (sip_contact_to_ami(contact, &buf)) {
 		/*
-		 * CLI uses a different formatter. ast_sip_sorcery_object_to_ami() logs the failure reason;
+		 * ast_sip_sorcery_object_to_ami() logs the failure reason;
 		 * continue so remaining contacts are still listed (returning CMP_STOP used to truncate AMI).
 		 */
 		ast_free(buf);
@@ -2473,7 +2464,7 @@ static int ami_show_contacts(struct mansession *s, const struct message *m)
 	struct ast_sip_ami ami = { .s = s, .m = m, .action_id = astman_get_header(m, "ActionID"), };
 	struct ao2_container *contacts;
 
-	contacts = get_all_contacts();
+	contacts = ast_sip_get_ami_contact_list_container("");
 	if (!contacts) {
 		astman_send_error(s, m, "Could not get Contacts\n");
 		return 0;
