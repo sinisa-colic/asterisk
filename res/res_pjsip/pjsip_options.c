@@ -2433,12 +2433,19 @@ static int format_ami_contactlist_handler(void *obj, void *arg, int flags)
 
 	buf = ast_sip_create_ami_event("ContactList", ami);
 	if (!buf) {
+		ast_log(LOG_ERROR,
+			"Could not allocate AMI buffer for ContactList event (contact '%s'); stopping contact list\n",
+			ast_sorcery_object_get_id(contact));
 		return CMP_STOP;
 	}
 
 	if (sip_contact_to_ami(contact, &buf)) {
+		/*
+		 * CLI uses a different formatter. ast_sip_sorcery_object_to_ami() logs the failure reason;
+		 * continue so remaining contacts are still listed (returning CMP_STOP used to truncate AMI).
+		 */
 		ast_free(buf);
-		return CMP_STOP;
+		return 0;
 	}
 
 	/* Add extra info */

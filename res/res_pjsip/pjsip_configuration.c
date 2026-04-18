@@ -1841,6 +1841,12 @@ int ast_sip_sorcery_object_to_ami(const void *obj, struct ast_str **buf)
 	struct ast_variable *i;
 
 	if (!objset) {
+		ast_log(LOG_WARNING,
+			"Unable to build AMI field set for sorcery object type '%s' id '%s'. "
+			"Usually the sorcery type is not registered, or no fields were serialized as strings "
+			"(see sorcery field handlers for this object type).\n",
+			ast_sorcery_object_get_type(obj),
+			ast_sorcery_object_get_id(obj));
 		return -1;
 	}
 
